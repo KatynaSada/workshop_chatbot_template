@@ -309,7 +309,7 @@ def build_tools(tools_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "search_company_data",
-                "description": "Search uploaded company documents for relevant information.",
+                "description": "Search the company knowledge base (files in company_data) for relevant information.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -663,9 +663,7 @@ def render_header(company: Dict[str, Any], logo_path: Optional[Path], chunk_coun
 
     logo_col, text_col = st.columns([1, 5], gap="medium")
     with logo_col:
-        if st.session_state.get("preview_logo"):
-            st.image(st.session_state.preview_logo, width=88)
-        elif logo_path:
+        if logo_path:
             st.image(str(logo_path), width=88)
         else:
             st.markdown(
@@ -697,48 +695,33 @@ def render_header(company: Dict[str, Any], logo_path: Optional[Path], chunk_coun
         )
 
 
+MODEL_CHOICES = ["glm-5-1", "hypernova-60b"]
+
+
 def render_sidebar(
     company: Dict[str, Any],
     tools_cfg: Dict[str, Any],
     model_cfg: Dict[str, Any],
-    logo_path: Optional[Path],
 ) -> Dict[str, Any]:
     make_runtime_tools_config(tools_cfg)
 
     with st.sidebar:
-        st.markdown("### ⚙️ Controls")
-        st.caption("Workshop settings — changes apply on the next message.")
+        st.markdown("### 🧪 Experiment controls")
+        st.caption("Change the model and tools, ask the same question, and watch tokens and time change.")
 
         st.markdown('<div class="sidebar-section">Model</div>', unsafe_allow_html=True)
+        current_model = normalize_model(model_cfg.get("default_model", "glm-5-1"))
         selected_model = st.selectbox(
             "Model",
-            ["glm-5-1", "hypernova-60b"],
-            index=0 if normalize_model(model_cfg.get("default_model", "glm-5-1")) == "glm-5-1" else 1,
+            MODEL_CHOICES,
+            index=MODEL_CHOICES.index(current_model) if current_model in MODEL_CHOICES else 0,
             label_visibility="collapsed",
+            help="Switch models and re-ask the same question to compare token usage and response time.",
         )
         model_cfg["default_model"] = selected_model
 
-        st.markdown('<div class="sidebar-section">Company</div>', unsafe_allow_html=True)
-        st.markdown(f"**{company.get('company_name', 'Student company')}**")
-
-        st.markdown('<div class="sidebar-section">Logo</div>', unsafe_allow_html=True)
-        uploaded_logo = st.file_uploader(
-            "Preview logo",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=False,
-            help="For a permanent logo, add an image to company_logo/ in GitHub.",
-            label_visibility="collapsed",
-        )
-        if uploaded_logo is not None:
-            st.session_state.preview_logo = uploaded_logo.getvalue()
-            st.session_state.preview_logo_name = uploaded_logo.name
-        if logo_path:
-            st.caption(f"✓ {logo_path.name}")
-        else:
-            st.caption("Add a logo to company_logo/")
-
         st.markdown('<div class="sidebar-section">Tools</div>', unsafe_allow_html=True)
-        st.caption("Toggle tools and compare tokens & speed.")
+        st.caption("Each enabled tool is sent to the model on every request, so it costs tokens even when unused.")
         for name, cfg in tools_cfg.get("tools", {}).items():
             default_value = bool(st.session_state.tool_enabled_overrides.get(name, cfg.get("enabled", False)))
             st.session_state.tool_enabled_overrides[name] = st.checkbox(
@@ -750,21 +733,24 @@ def render_sidebar(
 
         runtime_tools_cfg = make_runtime_tools_config(tools_cfg)
         enabled = active_tool_names(runtime_tools_cfg)
+        tool_schema = build_tools(runtime_tools_cfg)
+        tool_token_cost = estimate_tools_tokens(tool_schema)
 
-        st.markdown('<div class="sidebar-section">Active</div>', unsafe_allow_html=True)
-        if enabled:
-            st.markdown(" · ".join(f"`{name}`" for name in enabled))
-        else:
-            st.caption("No tools enabled")
+        c1, c2 = st.columns(2)
+        c1.metric("Tools on", len(enabled))
+        c2.metric("Tool tokens", f"~{tool_token_cost}", help="Approx. tokens the tool definitions add to every prompt.")
 
         st.divider()
         if st.button("↺ Reset chat", use_container_width=True):
             reset_chat(company.get("welcome_message", "Hello! How can I help?"))
             st.rerun()
+        if st.button("🧹 Clear comparison log", use_container_width=True):
+            st.session_state.runs = []
+            st.rerun()
 
-        st.caption("Edit `/config`, add files to `/company_data`, logo to `/company_logo`.")
+        st.caption("Add data to `/company_data`, a logo to `/company_logo`, and edit `/config` — all in the repo.")
 
-    return make_runtime_tools_config(tools_cfg)
+    return runtime_tools_cfg
 
 
 def render_suggested_questions(company: Dict[str, Any]):
@@ -787,6 +773,84 @@ def render_message_metrics(metrics: Optional[Dict[str, Any]]):
         st.markdown(f'<div class="metrics-pill">{caption}</div>', unsafe_allow_html=True)
 
 
+def record_run(question: str, metrics: Dict[str, Any]):
+    if "runs" not in st.session_state:
+        st.session_state.runs = []
+
+    tools_sent = metrics.get("tools_sent") or []
+    tools_called = metrics.get("tools_called") or []
+    st.session_state.runs.append({
+        "#": len(st.session_state.runs) + 1,
+        "Question": (question[:40] + "…") if len(question) > 40 else question,
+        "Model": metrics.get("model", "unknown"),
+        "Tools on": len(tools_sent),
+        "Time (s)": round(float(metrics.get("response_time_s", 0)), 2),
+        "Prompt tok": int(metrics.get("prompt_tokens", 0)),
+        "Completion tok": int(metrics.get("completion_tokens", 0)),
+        "Total tok": int(metrics.get("total_tokens", 0)),
+        "Tools called": ", ".join(tools_called) if tools_called else "—",
+        "Source": "API" if metrics.get("usage_source") == "api" else "estimated",
+    })
+
+
+def render_comparison_lab(demo_mode: bool):
+    runs = st.session_state.get("runs") or []
+    if not runs:
+        return
+
+    st.markdown("---")
+    st.markdown("### 📊 Comparison lab")
+    st.caption(
+        "Every message is logged here. Compare rows to see how tools and models change "
+        "token usage and response time."
+    )
+
+    if len(runs) >= 2:
+        last, prev = runs[-1], runs[-2]
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Total tokens",
+            last["Total tok"],
+            delta=last["Total tok"] - prev["Total tok"],
+            delta_color="inverse",
+        )
+        c2.metric(
+            "Response time (s)",
+            f'{last["Time (s)"]:.2f}',
+            delta=round(last["Time (s)"] - prev["Time (s)"], 2),
+            delta_color="inverse",
+        )
+        c3.metric("Tools on", last["Tools on"], delta=last["Tools on"] - prev["Tools on"])
+        st.caption("Deltas compare the latest run with the previous one. Lower tokens and time are better.")
+
+    if pd is not None:
+        df = pd.DataFrame(runs).set_index("#")
+        st.dataframe(df, use_container_width=True)
+        st.download_button(
+            "⬇️ Download results (CSV)",
+            df.to_csv().encode("utf-8"),
+            file_name="workshop_token_comparison.csv",
+            mime="text/csv",
+        )
+    else:
+        st.table(runs)
+
+    if demo_mode:
+        st.info(
+            "Demo mode: tokens are **estimated** and time is near zero, so models look identical. "
+            "Add `COMPACTIF_API_KEY` in secrets to see real per-model token counts and timing.",
+            icon="ℹ️",
+        )
+
+    with st.expander("How to run a good experiment"):
+        st.markdown(
+            "- **Tool cost:** ask one question with all tools OFF, then ON. Compare *Prompt tok*.\n"
+            "- **Model cost:** ask the *same* question on `glm-5-1`, then `hypernova-60b`. Compare *Total tok* and *Time (s)*.\n"
+            "- **Tool use:** ask a math question with the calculator ON vs OFF and watch *Tools called*.\n"
+            "- Keep the question identical so only one variable changes at a time."
+        )
+
+
 def main():
     st.set_page_config(page_title="Workshop Chatbot Template", page_icon="🤖", layout="wide")
 
@@ -801,7 +865,7 @@ def main():
     chunks = load_company_knowledge()
     demo_mode = not bool(get_secret("COMPACTIF_API_KEY"))
 
-    runtime_tools_cfg = render_sidebar(company, tools_cfg, model_cfg, logo_path)
+    runtime_tools_cfg = render_sidebar(company, tools_cfg, model_cfg)
     render_header(company, logo_path, len(chunks), demo_mode)
 
     if "messages" not in st.session_state:
@@ -816,6 +880,7 @@ def main():
 
     user_input = st.session_state.pop("pending_question", None) or st.chat_input("Message the assistant…")
     if not user_input:
+        render_comparison_lab(demo_mode)
         return
 
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -868,6 +933,8 @@ def main():
             render_message_metrics(metrics)
 
     st.session_state.messages.append({"role": "assistant", "content": answer, "metrics": metrics})
+    record_run(user_input, metrics)
+    render_comparison_lab(demo_mode)
 
 
 if __name__ == "__main__":
