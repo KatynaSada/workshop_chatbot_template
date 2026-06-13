@@ -166,7 +166,12 @@ def search_chunks(query: str, chunks: List[Dict[str, str]], top_k: int = 4) -> L
     return [item for _, item in scored[:top_k]]
 
 
-def build_system_prompt(company: Dict[str, Any], personality: Dict[str, Any], model_cfg: Dict[str, Any]) -> str:
+def build_system_prompt(
+    company: Dict[str, Any],
+    personality: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    use_company_data: bool = False,
+) -> str:
     lines = [
         f"You are {company.get('bot_name', 'the assistant')}.",
         f"Company/project: {company.get('company_name', 'Student company')}.",
@@ -188,12 +193,19 @@ def build_system_prompt(company: Dict[str, Any], personality: Dict[str, Any], mo
     for item in personality.get("safety_rules", []):
         lines.append(f"- Safety rule: {item}")
 
-    lines.extend([
-        "",
-        "Use the company knowledge snippets when they are relevant.",
-        "If you do not know the answer from the information available, say so clearly and suggest the next best step.",
-        "Do not invent company policies, prices, legal conditions, or technical procedures.",
-    ])
+    if use_company_data:
+        lines.extend([
+            "",
+            "Use the company knowledge snippets when they are relevant.",
+            "If you do not know the answer from the information available, say so clearly and suggest the next best step.",
+            "Do not invent company policies, prices, legal conditions, or technical procedures.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Company document search is turned OFF. Do not claim to have read company files.",
+            "Answer from the conversation and general knowledge only.",
+        ])
 
     if model_cfg.get("workshop_mode", True):
         lines.append("This is a workshop prototype, not a production system.")
@@ -333,6 +345,10 @@ def build_tools(tools_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def active_tool_names(tools_cfg: Dict[str, Any]) -> List[str]:
     return [name for name, cfg in tools_cfg.get("tools", {}).items() if cfg.get("enabled")]
+
+
+def company_data_enabled(tools_cfg: Dict[str, Any]) -> bool:
+    return bool(tools_cfg.get("tools", {}).get("search_company_data", {}).get("enabled", False))
 
 
 def make_runtime_tools_config(tools_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -945,16 +961,18 @@ def process_user_message(
     chunks: List[Dict[str, str]],
 ):
     use_history = bool(st.session_state.get("use_chat_history", True))
+    use_company_data = company_data_enabled(runtime_tools_cfg)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
-    relevant = search_chunks(user_input, chunks, top_k=4)
     knowledge_block = ""
-    if relevant:
-        knowledge_block = "\n\nRelevant company knowledge snippets:\n" + "\n\n".join(
-            f"Source: {r['source']}\n{r['text']}" for r in relevant
-        )
+    if use_company_data:
+        relevant = search_chunks(user_input, chunks, top_k=4)
+        if relevant:
+            knowledge_block = "\n\nRelevant company knowledge snippets:\n" + "\n\n".join(
+                f"Source: {r['source']}\n{r['text']}" for r in relevant
+            )
 
-    system_prompt = build_system_prompt(company, personality, model_cfg) + knowledge_block
+    system_prompt = build_system_prompt(company, personality, model_cfg, use_company_data) + knowledge_block
 
     api_messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if use_history:

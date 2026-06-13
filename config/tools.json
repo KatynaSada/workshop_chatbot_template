@@ -2,7 +2,7 @@
   "tools": {
     "search_company_data": {
       "enabled": true,
-      "student_note": "Lets the model search uploaded files and files in company_data. Recommended ON."
+      "student_note": "Turn ON to enable RAG: company files are searched and sent to the model. Turn OFF and no company_data is used."
     },
     "calculator": {
       "enabled": true,
